@@ -19,11 +19,12 @@ import {
 import { Mic, MicOff, Video, VideoOff, PhoneOff, Copy, Languages, MessageSquare, AlertCircle, LogIn, PlusCircle, UserCircle } from 'lucide-react';
 
 // --- IMPORTANT: Firebase Configuration ---
-const firebaseConfig = typeof __firebase_config !== 'undefined' 
-    ? JSON.parse(__firebase_config) 
-    : { apiKey: "YOUR_API_KEY", authDomain: "...", projectId: "..." };
+// This code now ONLY uses environment variables for deployment.
+const firebaseConfig = process.env.REACT_APP_FIREBASE_CONFIG 
+    ? JSON.parse(process.env.REACT_APP_FIREBASE_CONFIG) 
+    : {};
 
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-translate-app';
+const appId = process.env.REACT_APP_ID || 'default-translate-app';
 
 // --- Language Options ---
 const LANGUAGES = {
@@ -163,29 +164,34 @@ export default function App() {
 
     // --- Firebase Initialization & Auth ---
     useEffect(() => {
-        const app = initializeApp(firebaseConfig);
-        const firestoreDb = getFirestore(app);
-        const firebaseAuth = getAuth(app);
-        setDb(firestoreDb);
+        if (Object.keys(firebaseConfig).length > 0) {
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+            setDb(firestoreDb);
 
-        const authSub = onAuthStateChanged(firebaseAuth, async (user) => {
-            if (user) {
-                setUserId(user.uid);
-            } else {
-                try {
-                    const { user } = await signInAnonymously(firebaseAuth);
+            const authSub = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
                     setUserId(user.uid);
-                } catch (error) {
-                    console.error("Anonymous sign-in failed:", error);
-                    setStatus({ text: 'Authentication Failed', type: 'error' });
+                } else {
+                    try {
+                        const { user } = await signInAnonymously(firebaseAuth);
+                        setUserId(user.uid);
+                    } catch (error) {
+                        console.error("Anonymous sign-in failed:", error);
+                        setStatus({ text: 'Authentication Failed', type: 'error' });
+                    }
                 }
-            }
-        });
-        
-        return () => {
-             authSub();
-             listenersRef.current.forEach(unsubscribe => unsubscribe());
-        };
+            });
+            
+            return () => {
+                 authSub();
+                 listenersRef.current.forEach(unsubscribe => unsubscribe());
+            };
+        } else {
+             console.error("Firebase config is missing. Check your .env file or Render environment variables.");
+             setStatus({ text: 'Configuration Error', type: 'error' });
+        }
 
     }, []);
     
@@ -198,6 +204,30 @@ export default function App() {
     
     // --- Utility to update status ---
     const updateStatus = (text, type) => setStatus({ text, type });
+
+    const hangUp = useCallback(async () => {
+        listenersRef.current.forEach(unsubscribe => unsubscribe());
+        listenersRef.current = [];
+
+        if(pc.current) {
+            pc.current.close();
+            pc.current = null;
+        }
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+        }
+        if(recognition.current) {
+           recognition.current.stop();
+        }
+
+        setLocalStream(null);
+        setRemoteStream(null);
+        setCallId('');
+        setCaptions([]);
+        setIsRecognizing(false);
+        setMode('home');
+        updateStatus('Ready', 'idle');
+    }, [localStream, db, callId]);
 
     // --- Core WebRTC & Signaling Logic ---
     const setupCall = useCallback(async (isCreator, id, lang) => {
@@ -242,14 +272,14 @@ export default function App() {
             
             const callSub = onSnapshot(callDocRef, (snapshot) => {
                 const data = snapshot.data();
-                if (!pc.current.currentRemoteDescription && data?.answer) {
+                if (pc.current && !pc.current.currentRemoteDescription && data?.answer) {
                     updateStatus('Connecting...', 'connecting');
                     pc.current.setRemoteDescription(new RTCSessionDescription(data.answer));
                 }
             });
             const answerCandidatesSub = onSnapshot(answerCandidatesCol, (snapshot) => {
                 snapshot.docChanges().forEach((change) => {
-                    if (change.type === 'added') pc.current.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+                    if (change.type === 'added') pc.current?.addIceCandidate(new RTCIceCandidate(change.doc.data()));
                 });
             });
             listenersRef.current.push(callSub, answerCandidatesSub);
@@ -265,7 +295,7 @@ export default function App() {
 
                 const offerCandidatesSub = onSnapshot(offerCandidatesCol, (snapshot) => {
                     snapshot.docChanges().forEach((change) => {
-                        if (change.type === 'added') pc.current.addIceCandidate(new RTCIceCandidate(change.doc.data()));
+                        if (change.type === 'added') pc.current?.addIceCandidate(new RTCIceCandidate(change.doc.data()));
                     });
                 });
                 listenersRef.current.push(offerCandidatesSub);
@@ -276,10 +306,17 @@ export default function App() {
         }
         
         pc.current.onconnectionstatechange = () => {
+            if (!pc.current) return;
             const state = pc.current.connectionState;
             if (state === 'connected') updateStatus('Connected', 'connected');
-            if (state === 'disconnected' || state === 'closed') updateStatus('Disconnected', 'disconnected');
-            if (state === 'failed') updateStatus('Connection failed', 'error');
+            if (state === 'disconnected' || state === 'closed') {
+                updateStatus('Disconnected', 'disconnected');
+                hangUp();
+            }
+            if (state === 'failed') {
+                updateStatus('Connection failed', 'error');
+                hangUp();
+            };
         };
 
         const captionsCol = collection(callDocRef, 'captions');
@@ -290,7 +327,7 @@ export default function App() {
         });
         listenersRef.current.push(captionsSub);
 
-    }, [db, userId]);
+    }, [db, userId, hangUp]);
 
 
     // --- Action Handlers ---
@@ -304,38 +341,6 @@ export default function App() {
     const handleJoinCall = useCallback(async (id, lang) => {
         await setupCall(false, id, lang);
     }, [setupCall]);
-
-    const hangUp = useCallback(async () => {
-        listenersRef.current.forEach(unsubscribe => unsubscribe());
-        listenersRef.current = [];
-
-        if(pc.current) {
-            pc.current.close();
-            pc.current = null;
-        }
-        if (localStream) {
-            localStream.getTracks().forEach(track => track.stop());
-        }
-        if(recognition.current) {
-           recognition.current.stop();
-        }
-
-        // Clean up Firestore document
-        if (db && callId) {
-            const callDocRef = doc(db, 'artifacts', appId, 'public/data/calls', callId);
-            // Optional: You might want to delete the call document after some time.
-            // For simplicity, we just leave it. Or you could mark it as "ended".
-            // await deleteDoc(callDocRef); 
-        }
-
-        setLocalStream(null);
-        setRemoteStream(null);
-        setCallId('');
-        setCaptions([]);
-        setIsRecognizing(false);
-        setMode('home');
-        updateStatus('Ready', 'idle');
-    }, [localStream, db, callId]);
     
     const toggleMediaTrack = (type, setter) => {
         if(!localStream) return;
@@ -418,6 +423,7 @@ export default function App() {
         return (
             <div className="bg-gray-900 text-white min-h-screen flex items-center justify-center">
                 <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+                <p className="ml-4">Connecting to Services...</p>
             </div>
         );
     }
@@ -475,19 +481,19 @@ export default function App() {
             </div>
 
             {/* Control Bar */}
-            <div className="flex-shrink-0 flex items-center justify-center bg-gray-800 p-2 rounded-lg gap-4">
+            <div className="flex-shrink-0 flex items-center justify-center bg-gray-800 p-2 rounded-lg gap-4 relative">
                 <IconButton onClick={() => toggleMediaTrack('audio', setIsMuted)} className={isMuted ? 'bg-red-500' : 'bg-gray-600 hover:bg-gray-500'} text={isMuted ? 'Unmute' : 'Mute'}>
                     {isMuted ? <MicOff /> : <Mic />}
                 </IconButton>
                 <IconButton onClick={() => toggleMediaTrack('video', setIsCameraOff)} className={isCameraOff ? 'bg-red-500' : 'bg-gray-600 hover:bg-gray-500'} text={isCameraOff ? 'Cam On' : 'Cam Off'}>
                     {isCameraOff ? <VideoOff /> : <Video />}
                 </IconButton>
-                 <IconButton onClick={() => {if(window.confirm('Are you sure you want to end the call?')) hangUp()}} className="bg-red-600 hover:bg-red-700" text="End Call">
+                 <IconButton onClick={hangUp} className="bg-red-600 hover:bg-red-700" text="End Call">
                     <PhoneOff />
                 </IconButton>
-                <div className="absolute right-8">
+                <div className="absolute right-4 md:right-8">
                      <button onClick={() => navigator.clipboard.writeText(callId)} className="group flex items-center gap-2 text-xs bg-gray-700 p-2 rounded-lg hover:bg-gray-600">
-                        <Copy size={14} /> <span className="font-mono">{callId}</span>
+                        <Copy size={14} /> <span className="font-mono hidden md:inline">{callId}</span>
                         <span className="absolute -top-8 left-1/2 -translate-x-1/2 bg-black text-white px-2 py-1 rounded text-xs opacity-0 group-hover:opacity-100 transition-opacity">Copy ID</span>
                      </button>
                 </div>
